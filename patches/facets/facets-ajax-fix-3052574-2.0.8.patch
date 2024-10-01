@@ -1,0 +1,856 @@
+From 92b7ec28535f2d15c04645c4976457db486ea0df Mon Sep 17 00:00:00 2001
+From: Ted Cooper <elc@784944.no-reply.drupal.org>
+Date: Fri, 16 Aug 2024 00:20:35 +1000
+Subject: [PATCH 1/2] [#3052574] Fix Facets with AJAX.
+
+---
+ facets.module                                 |  19 ++-
+ js/facets-views-ajax.js                       | 155 +++++++++++++-----
+ modules/facets_summary/facets_summary.module  |  23 +++
+ .../facets_summary.services.yml               |   2 +
+ .../DefaultFacetsSummaryManager.php           |  60 ++++++-
+ .../src/Plugin/Block/FacetsSummaryBlock.php   |  48 ++++--
+ src/Controller/FacetBlockAjaxController.php   | 117 ++++++++-----
+ src/Plugin/Block/FacetBlock.php               |  67 +++++---
+ .../FunctionalJavascript/AjaxBehaviorTest.php |   6 +-
+ 9 files changed, 369 insertions(+), 128 deletions(-)
+
+diff --git a/facets.module b/facets.module
+index e5cd82c..7141bb7 100644
+--- a/facets.module
++++ b/facets.module
+@@ -125,20 +125,27 @@ function facets_entity_presave(EntityInterface $entity) {
+ /**
+  * Implements hook_preprocess_block().
+  *
+- * Adds a class for the widget to the facet block to allow for more specific
+- * styling.
++ * Adds some classes for hiding empty blocks, working ajax, and more.
+  */
+ function facets_preprocess_block(&$variables) {
+   if ($variables['configuration']['provider'] == 'facets') {
+     // Hide the block if it's empty.
+-    if (!empty($variables['elements']['content'][0]['#attributes']['class']) && in_array('facet-hidden', $variables['elements']['content'][0]['#attributes']['class'])) {
+-      // Add the Drupal class for hiding this for everyone, including screen
+-      // readers. See hidden.module.css in the core system module.
+-      $variables['attributes']['class'][] = 'hidden';
++    if (!empty($variables['content']['facet_block']['#attributes'])) {
++      $attributes = $variables['content']['facet_block']['#attributes'];
++      if (isset($attributes['class'])) {
++        if (in_array('hidden', $attributes['class'])) {
++          // Add the Drupal class for hiding this for everyone, including screen
++          // readers. See hidden.module.css in the core system module.
++          $variables['attributes']['class'][] = 'hidden';
++        }
++      }
+     }
++
+     if (!empty($variables['derivative_plugin_id'])) {
+       $facet = Facet::load($variables['derivative_plugin_id']);
+       $variables['attributes']['class'][] = 'block-facet--' . Html::cleanCssIdentifier($facet->getWidget()['type']);
++      // For use ajax.
++      $variables['attributes']['data-drupal-block-facet-id'] = $facet->id();
+     }
+   }
+ }
+diff --git a/js/facets-views-ajax.js b/js/facets-views-ajax.js
+index 0ee7077..8b4983a 100644
+--- a/js/facets-views-ajax.js
++++ b/js/facets-views-ajax.js
+@@ -3,7 +3,6 @@
+  * Facets views AJAX handling.
+  */
+ 
+-
+ (function ($, Drupal, once) {
+   'use strict';
+ 
+@@ -26,9 +25,11 @@
+           $.each(settings.views.ajaxViews, function (domId, viewSettings) {
+             // Check if we have facet for this view.
+             if (facetSettings.view_id == viewSettings.view_name && facetSettings.current_display_id == viewSettings.view_display_id) {
+-              view = $('.js-view-dom-id-' + viewSettings.view_dom_id);
+-              current_dom_id = viewSettings.view_dom_id;
+-              view_path = facetSettings.ajax_path;
++              if ($('.js-view-dom-id-' + viewSettings.view_dom_id).length > 0) {
++                view = $('.js-view-dom-id-' + viewSettings.view_dom_id);
++                current_dom_id = viewSettings.view_dom_id;
++                view_path = facetSettings.ajax_path;
++              }
+             }
+           });
+         }
+@@ -37,22 +38,80 @@
+           return;
+         }
+ 
+-        // Update view on summary block click.
+-        if (updateFacetsSummaryBlock() && (facetId === 'facets_summary_ajax')) {
+-          $(once(facetId, '[data-drupal-facets-summary-id=' + facetSettings.facets_summary_id + '] ul li')).click(function (e) {
+-            e.preventDefault();
+-            var facetLink = $(this).find('a');
+-            updateFacetsView(facetLink.attr('href'), current_dom_id, view_path);
+-          });
++        // Update view on range slider stop event.
++        if (typeof settings.facets !== "undefined" && settings.facets.sliders && settings.facets.sliders[facetId]) {
++          settings.facets.sliders[facetId].stop = function (e, ui) {
++            const sliderSettings = settings.facets.sliders[facetId];
++            var href = sliderSettings.url.replace('__range_slider_min__', Math.round(ui.values[0])).replace('__range_slider_max__', Math.round(ui.values[1]));
++
++            // Update facet query params on the request.
++            var currentHref = window.location.href;
++            var currentQueryParams = Drupal.Views.parseQueryString(currentHref);
++            var newQueryParams = Drupal.Views.parseQueryString(href);
++
++            var queryParams = {};
++            var facetPositions = [];
++            var fCount = 0;
++            var value = '';
++            var facetKey = '';
++            for (var paramName in currentQueryParams) {
++              if (paramName.substr(0, 1) === 'f') {
++                value = currentQueryParams[paramName];
++                // Store the facet position so we can override it later.
++                facetKey = value.substr(0, value.indexOf(':'));
++                facetPositions[facetKey] = fCount;
++                queryParams['f[' + fCount + ']'] = value;
++                fCount++;
++              }
++              else {
++                queryParams[paramName] = currentQueryParams[paramName];
++              }
++            }
++
++            var paramKey = '';
++            for (let paramName in newQueryParams) {
++              if (paramName.substr(0, 1) === 'f') {
++                value = newQueryParams[paramName];
++                // Replace.
++                facetKey = value.substr(0, value.indexOf(':'));
++                if (typeof facetPositions[facetKey] !== 'undefined') {
++                  paramKey = 'f[' + facetPositions[facetKey] + ']';
++                }
++                else {
++                  paramKey = 'f[' + fCount + ']';
++                  fCount++;
++                }
++                queryParams[paramKey] = newQueryParams[paramName];
++              }
++              else {
++                queryParams[paramName] = newQueryParams[paramName];
++              }
++            }
++
++            href = settings.path.baseUrl + Drupal.Views.getPath(href) + '?' + $.param(queryParams);
++
++            updateFacetsView(href, current_dom_id, view_path);
++          };
++        }
++        else if (facetId == 'facets_summary_ajax_summary' || facetId == 'facets_summary_ajax_summary_count') {
++          if (updateFacetsSummaryBlock()) {
++            $(once('data-drupal-facets-summary-id', '[data-drupal-facets-summary-id=' + facetSettings.facets_summary_id + ']')).children('ul').children('li').click(function (e) {
++              e.preventDefault();
++              var facetLink = $(this).find('a');
++              updateFacetsView(facetLink.attr('href'), current_dom_id, view_path);
++            });
++          }
+         }
+         // Update view on facet item click.
+         else {
+-          $('[data-drupal-facet-id=' + facetId + ']').each(function (index, facet_item) {
++          $('[data-drupal-facet-id |= ' + facetId + ']').each(function (index, facet_item) {
+             if ($(facet_item).hasClass('js-facets-widget')) {
+               $(facet_item).unbind('facets_filter.facets');
+               $(facet_item).on('facets_filter.facets', function (event, url) {
+                 $('.js-facets-widget').trigger('facets_filtering');
+-
++                if (typeof url["0"]["href"] !== 'undefined') {
++                  url = url["0"]["href"];
++                }
+                 updateFacetsView(url, current_dom_id, view_path);
+               });
+             }
+@@ -64,7 +123,7 @@
+   };
+ 
+   // Helper function to update views output & Ajax facets.
+-  var updateFacetsView = function (href, current_dom_id, view_path) {
++  var updateFacetsView = function (href, current_dom_id, view_path, pushstate = true) {
+     // Refresh view.
+     var views_parameters = Drupal.Views.parseQueryString(href);
+     var views_arguments = Drupal.Views.parseViewArgs(href, 'search');
+@@ -82,17 +141,39 @@
+ 
+     Drupal.ajax(views_ajax_settings).execute();
+ 
+-    // Update url.
+-    window.historyInitiated = true;
+-    window.history.pushState(null, document.title, href);
++    if (pushstate) {
++      // Update url.
++      window.historyInitiated = true;
++      const url = new URL(href, window.location.origin);
++
++      if (url) {
++        const view_state = {
++          view_href: url.pathname,
++          current_dom_id: current_dom_id,
++          view_path: view_path
++        };
++        // replace the current history state so that it is available on popstate when clicking back after first
++        window.history.replaceState(view_state, document.title);
++        window.history.pushState(view_state, document.title, window.location.origin + url.pathname + url.search);
+ 
+-    // ToDo: Update views+facets with ajax on history back.
+-    // For now we will reload the full page.
+-    window.addEventListener("popstate", function (e) {
+-      if (window.historyInitiated) {
+-        window.location.reload();
+       }
+-    });
++
++      if (once('facetsViewsAjaxPopstate', 'body').length) {
++        $(document).each( function() {
++          window.addEventListener("popstate", function (e) {
++            if (window.historyInitiated) {
++              if (e.state) {
++                updateFacetsView(e.state.view_href + this.window.location.search, e.state.current_dom_id, e.state.view_path, false);
++              }
++              else {
++                // if the current history "page" doesn't have a state just reload
++                window.location.reload();
++              }
++            }
++          });
++        });
++      }
++    }
+ 
+     // Refresh facets blocks.
+     updateFacetsBlocks(href);
+@@ -104,7 +185,7 @@
+     var facets_blocks = facetsBlocks();
+ 
+     // Remove All Range Input Form Facet Blocks from being updated.
+-    if(settings.facets && settings.facets.rangeInput) {
++    if (settings.facets && settings.facets.rangeInput) {
+       $.each(settings.facets.rangeInput, function (index, value) {
+         delete facets_blocks[value.facetId];
+       });
+@@ -121,17 +202,17 @@
+ 
+     // Update facets summary block.
+     if (updateFacetsSummaryBlock()) {
+-      var facet_summary_wrapper_id = $('[data-drupal-facets-summary-id=' + settings.facets_views_ajax.facets_summary_ajax.facets_summary_id + ']').attr('id');
+-      var facet_summary_block_id = '';
+-      if (facet_summary_wrapper_id.indexOf('--') !== -1) {
+-        facet_summary_block_id = facet_summary_wrapper_id.substring(0, facet_summary_wrapper_id.indexOf('--')).replace('block-', '');
+-      }
+-      else {
+-        facet_summary_block_id = facet_summary_wrapper_id.replace('block-', '');
+-      }
+       facet_settings.submit.update_summary_block = true;
+-      facet_settings.submit.facet_summary_block_id = facet_summary_block_id;
+-      facet_settings.submit.facet_summary_wrapper_id = settings.facets_views_ajax.facets_summary_ajax.facets_summary_id;
++      facet_settings.submit.facet_summary_plugin_ids = {};
++      let summary_selector = '[data-drupal-facets-summary-id=' + settings.facets_views_ajax.facets_summary_ajax_summary.facets_summary_id + ']';
++      if (settings.facets_views_ajax.facets_summary_ajax_summary_count !== undefined) {
++        summary_selector += ', [data-drupal-facets-summary-id=' + settings.facets_views_ajax.facets_summary_ajax_summary_count.facets_summary_id + ']';
++      }
++      $(summary_selector).each(function (index, summaryWrapper) {
++        let summaryPluginId = $(summaryWrapper).attr('data-drupal-facets-summary-plugin-id');
++        let summaryPluginIdWrapper = $(summaryWrapper).attr('id');
++        facet_settings.submit.facet_summary_plugin_ids[summaryPluginIdWrapper] = summaryPluginId;
++      });
+     }
+ 
+     Drupal.ajax(facet_settings).execute();
+@@ -143,7 +224,7 @@
+     var settings = drupalSettings;
+     var update_summary = false;
+ 
+-    if (settings.facets_views_ajax.facets_summary_ajax) {
++    if (settings.facets_views_ajax.facets_summary_ajax_summary || settings.facets_views_ajax.facets_summary_ajax_summary_count) {
+       update_summary = true;
+     }
+ 
+@@ -162,8 +243,8 @@
+           return v.slice(block_id_start.length, v.length);
+         }
+       }).join();
+-      var block_selector = '#' + $(this).attr('id');
+-      facets_blocks[block_id] = block_selector;
++      var block_selector = $(this).attr('id');
++      facets_blocks[block_selector] = block_id;
+     });
+ 
+     return facets_blocks;
+diff --git a/modules/facets_summary/facets_summary.module b/modules/facets_summary/facets_summary.module
+index a26ecbb..9df781e 100644
+--- a/modules/facets_summary/facets_summary.module
++++ b/modules/facets_summary/facets_summary.module
+@@ -119,3 +119,26 @@ function facets_summary_preprocess_facets_summary_item_list(array &$variables) {
+     }
+   }
+ }
++
++/**
++ * Implements hook_preprocess_block().
++ *
++ * Adds some classes for hiding empty blocks, working ajax, and more.
++ */
++function facets_summary_preprocess_block(&$variables) {
++  if ($variables['configuration']['provider'] == 'facets_summary') {
++    // Hide the block if it's empty.
++    if (!empty($variables['content']['facets_summary']['#attributes'])) {
++      $attributes = $variables['content']['facets_summary']['#attributes'];
++      if (isset($attributes['class'])) {
++        if (in_array('hidden', $attributes['class'])) {
++          // Add the Drupal class for hiding this for everyone, including screen
++          // readers. See hidden.module.css in the core system module.
++          $variables['attributes']['class'][] = 'hidden';
++        }
++      }
++    }
++    // For use ajax.
++    $variables['attributes']['data-drupal-block-facet-summary-id'] = $variables['configuration']['id'];
++  }
++}
+diff --git a/modules/facets_summary/facets_summary.services.yml b/modules/facets_summary/facets_summary.services.yml
+index ba1a6f5..bd8f14e 100644
+--- a/modules/facets_summary/facets_summary.services.yml
++++ b/modules/facets_summary/facets_summary.services.yml
+@@ -8,6 +8,8 @@ services:
+       - '@plugin.manager.facets.facet_source'
+       - '@plugin.manager.facets_summary.processor'
+       - '@facets.manager'
++      - '@plugin.manager.facets.url_processor'
++      - '@facets.utility.url_generator'
+   facets_summary.search_api_subscriber:
+     class: Drupal\facets_summary\EventSubscriber\SearchApiSubscriber
+     arguments: ['@entity_type.manager']
+diff --git a/modules/facets_summary/src/FacetsSummaryManager/DefaultFacetsSummaryManager.php b/modules/facets_summary/src/FacetsSummaryManager/DefaultFacetsSummaryManager.php
+index 47f62b0..7d84e6e 100644
+--- a/modules/facets_summary/src/FacetsSummaryManager/DefaultFacetsSummaryManager.php
++++ b/modules/facets_summary/src/FacetsSummaryManager/DefaultFacetsSummaryManager.php
+@@ -4,13 +4,17 @@ namespace Drupal\facets_summary\FacetsSummaryManager;
+ 
+ use Drupal\Core\Link;
+ use Drupal\Core\StringTranslation\StringTranslationTrait;
++use Drupal\Core\Url;
+ use Drupal\facets\Exception\InvalidProcessorException;
+ use Drupal\facets\FacetManager\DefaultFacetManager;
+ use Drupal\facets\FacetSource\FacetSourcePluginManager;
++use Drupal\facets\Result\Result;
+ use Drupal\facets_summary\Processor\BuildProcessorInterface;
+ use Drupal\facets_summary\Processor\ProcessorInterface;
+ use Drupal\facets_summary\Processor\ProcessorPluginManager;
+ use Drupal\facets_summary\FacetsSummaryInterface;
++use Drupal\facets\UrlProcessor\UrlProcessorPluginManager;
++use Drupal\facets\Utility\FacetsUrlGenerator;
+ 
+ /**
+  * The facet summary manager.
+@@ -45,6 +49,20 @@ class DefaultFacetsSummaryManager {
+    */
+   protected $facetManager;
+ 
++  /**
++   * The url processor plugin manager.
++   *
++   * @var \Drupal\facets\UrlProcessor\UrlProcessorPluginManager
++   */
++  protected $urlProcessorPluginManager;
++
++  /**
++   * The facets url generator.
++   *
++   * @var \Drupal\facets\Utility\FacetsUrlGenerator
++   */
++  protected $facetsUrlGenerator;
++
+   /**
+    * @var \Drupal\facets\FacetInterface[]
+    */
+@@ -59,11 +77,17 @@ class DefaultFacetsSummaryManager {
+    *   The facets summary processor plugin manager.
+    * @param \Drupal\facets\FacetManager\DefaultFacetManager $facet_manager
+    *   The facet manager service.
++   * @param \Drupal\facets\UrlProcessor\UrlProcessorPluginManager $url_processor_plugin_manager
++   *   The url processor plugin manager.
++   * @param \Drupal\facets\Utility\FacetsUrlGenerator $facets_url_generator
++   *   The facets url generator.
+    */
+-  public function __construct(FacetSourcePluginManager $facet_source_manager, ProcessorPluginManager $processor_plugin_manager, DefaultFacetManager $facet_manager) {
++  public function __construct(FacetSourcePluginManager $facet_source_manager, ProcessorPluginManager $processor_plugin_manager, DefaultFacetManager $facet_manager, UrlProcessorPluginManager $url_processor_plugin_manager, FacetsUrlGenerator $facets_url_generator) {
+     $this->facetSourcePluginManager = $facet_source_manager;
+     $this->processorPluginManager = $processor_plugin_manager;
+     $this->facetManager = $facet_manager;
++    $this->urlProcessorPluginManager = $url_processor_plugin_manager;
++    $this->facetsUrlGenerator = $facets_url_generator;
+   }
+ 
+   /**
+@@ -114,7 +138,7 @@ class DefaultFacetsSummaryManager {
+       '#theme' => 'facets_summary_item_list',
+       '#facet_summary_id' => $facets_summary->id(),
+       '#attributes' => [
+-        'data-drupal-facets-summary-id' => $facets_summary->id(),
++        'class' => ['facet-summary__items'],
+       ],
+     ];
+ 
+@@ -125,8 +149,36 @@ class DefaultFacetsSummaryManager {
+ 
+     $results = [];
+     foreach ($facets as $facet) {
+-      $show_count = $facets_config[$facet->id()]['show_count'];
+-      $results = array_merge($results, $this->buildResultTree($show_count, $facet->getResults()));
++      $enabled_processors = $facet->getProcessors(TRUE);
++      if (isset($enabled_processors["range_slider"])) {
++        $active_values = $facet->getActiveItems();
++        if ($active_values) {
++          $min = $active_values[0][0];
++          $max = $active_values[0][1];
++          $url_processor = $this->urlProcessorPluginManager->createInstance($facet->getFacetSourceConfig()->getUrlProcessorName(), ['facet' => $facet]);
++          $active_filters = $url_processor->getActiveFilters();
++          if (isset($active_filters[''])) {
++            unset($active_filters['']);
++          }
++          unset($active_filters[$facet->id()]);
++          // Only if there are still active filters, use url generator.
++          if ($active_filters) {
++            $url = $this->facetsUrlGenerator->getUrl($active_filters, FALSE);
++          }
++          else {
++            // @todo Keep non-facet related get params.
++            $url = Url::fromUserInput($facets_summary->getFacetSource()->getPath());
++          }
++          $result_without_current_rangeslider = new Result($facet, "(min:$min,max:$max)", " $min - $max", 1);
++          $result_without_current_rangeslider->setActiveState(TRUE);
++          $result_without_current_rangeslider->setUrl($url);
++          $results = array_merge($results, $this->buildResultTree(FALSE, [$result_without_current_rangeslider]));
++        }
++      }
++      else {
++        $show_count = $facets_config[$facet->id()]['show_count'];
++        $results = array_merge($results, $this->buildResultTree($show_count, $facet->getResults()));
++      }
+     }
+     $build['#items'] = $results;
+ 
+diff --git a/modules/facets_summary/src/Plugin/Block/FacetsSummaryBlock.php b/modules/facets_summary/src/Plugin/Block/FacetsSummaryBlock.php
+index fbd1fcb..cb26e75 100644
+--- a/modules/facets_summary/src/Plugin/Block/FacetsSummaryBlock.php
++++ b/modules/facets_summary/src/Plugin/Block/FacetsSummaryBlock.php
+@@ -7,6 +7,7 @@ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Cache\CacheableMetadata;
+ use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+ use Drupal\Core\Url;
++use Drupal\Component\Utility\Html;
+ use Drupal\facets_summary\Entity\FacetsSummary;
+ use Drupal\facets_summary\FacetsSummaryBlockInterface;
+ use Drupal\facets_summary\FacetsSummaryManager\DefaultFacetsSummaryManager;
+@@ -99,31 +100,48 @@ class FacetsSummaryBlock extends BlockBase implements FacetsSummaryBlockInterfac
+     $facets_summary = $this->getEntity();
+ 
+     // Let the facet_manager build the facets.
+-    $build = $this->facetsSummaryManager->build($facets_summary);
++    $build = [];
+ 
+-    // Add contextual links only when we have results.
+-    if (!empty($build)) {
+-      CacheableMetadata::createFromObject($this)->applyTo($build);
+-
+-      $build['#contextual_links']['facets_summary'] = [
+-        'route_parameters' => ['facets_summary' => $facets_summary->id()],
++    // Let the facet_manager build the facets.
++    $summary_build = $this->facetsSummaryManager->build($facets_summary);
++
++    if ($summary_build) {
++      $build = [
++        'facets_summary' => [
++          '#type' => 'container',
++          '#contextual_links' => [
++            'facets_summary' => [
++              'route_parameters' => ['facets_summary' => $facets_summary->id()],
++            ],
++          ],
++          '#attributes' => [
++            'data-drupal-facets-summary-id' => $facets_summary->id(),
++            'data-drupal-facets-summary-plugin-id' => $this->getPluginId(),
++            'id' => Html::getUniqueId(str_replace(':', '-', $this->getPluginId())),
++            'class' => [
++              'facets-summary-block__wrapper',
++            ],
++          ],
++          'summary_build' => $summary_build,
++        ],
+       ];
+-    }
++      // Hidden empty result.
++      if (!isset($summary_build['#items']) && !isset($summary_build['#message'])) {
++        $build['facets_summary']['#attributes']['class'][] = 'hidden';
++      }
+ 
+-    /** @var \Drupal\views\ViewExecutable $view */
+-    if ($view = $facets_summary->getFacetSource()->getViewsDisplay()) {
+-      $build['#attached']['drupalSettings']['facets_views_ajax'] = [
+-        'facets_summary_ajax' => [
++      /** @var \Drupal\views\ViewExecutable $view */
++      if ($view = $facets_summary->getFacetSource()->getViewsDisplay()) {
++        $build['#attached']['drupalSettings']['facets_views_ajax']['facets_summary_ajax_summary'] = [
+           'facets_summary_id' => $facets_summary->id(),
+           'view_id' => $view->id(),
+           'current_display_id' => $view->current_display,
+           'ajax_path' => Url::fromRoute('views.ajax')->toString(),
+-        ],
+-      ];
++        ];
++      }
+     }
+ 
+     return $build;
+-
+   }
+ 
+   /**
+diff --git a/src/Controller/FacetBlockAjaxController.php b/src/Controller/FacetBlockAjaxController.php
+index 6bc9df1..253e376 100644
+--- a/src/Controller/FacetBlockAjaxController.php
++++ b/src/Controller/FacetBlockAjaxController.php
+@@ -5,6 +5,7 @@ namespace Drupal\facets\Controller;
+ use Drupal\Core\Ajax\AjaxResponse;
+ use Drupal\Core\Ajax\InvokeCommand;
+ use Drupal\Core\Ajax\ReplaceCommand;
++use Drupal\Core\Block\BlockManager;
+ use Drupal\Core\Controller\ControllerBase;
+ use Drupal\Core\Path\CurrentPathStack;
+ use Drupal\Core\PathProcessor\PathProcessorManager;
+@@ -28,13 +29,6 @@ class FacetBlockAjaxController extends ControllerBase {
+    */
+   protected $storage;
+ 
+-  /**
+-   * The renderer.
+-   *
+-   * @var \Drupal\Core\Render\RendererInterface
+-   */
+-  protected $renderer;
+-
+   /**
+    * The current path.
+    *
+@@ -63,11 +57,16 @@ class FacetBlockAjaxController extends ControllerBase {
+    */
+   protected $currentRouteMatch;
+ 
++  /**
++   * The block manager service.
++   *
++   * @var \Drupal\Core\Block\BlockManager
++   */
++  protected $blockManager;
++
+   /**
+    * Constructs a FacetBlockAjaxController object.
+    *
+-   * @param \Drupal\Core\Render\RendererInterface $renderer
+-   *   The renderer service.
+    * @param \Drupal\Core\Path\CurrentPathStack $currentPath
+    *   The current path service.
+    * @param \Symfony\Component\Routing\RouterInterface $router
+@@ -76,14 +75,16 @@ class FacetBlockAjaxController extends ControllerBase {
+    *   The path processor manager.
+    * @param \Drupal\Core\Routing\CurrentRouteMatch $currentRouteMatch
+    *   The current route match service.
++   * @param \Drupal\Core\Block\BlockManager $blockManager
++   *   The block manager service.
+    */
+-  public function __construct(RendererInterface $renderer, CurrentPathStack $currentPath, RouterInterface $router, PathProcessorManager $pathProcessor, CurrentRouteMatch $currentRouteMatch) {
++  public function __construct(CurrentPathStack $currentPath, RouterInterface $router, PathProcessorManager $pathProcessor, CurrentRouteMatch $currentRouteMatch, BlockManager $blockManager) {
+     $this->storage = $this->entityTypeManager()->getStorage('block');
+-    $this->renderer = $renderer;
+     $this->currentPath = $currentPath;
+     $this->router = $router;
+     $this->pathProcessor = $pathProcessor;
+     $this->currentRouteMatch = $currentRouteMatch;
++    $this->blockManager = $blockManager;
+   }
+ 
+   /**
+@@ -91,11 +92,11 @@ class FacetBlockAjaxController extends ControllerBase {
+    */
+   public static function create(ContainerInterface $container) {
+     return new static(
+-      $container->get('renderer'),
+       $container->get('path.current'),
+       $container->get('router'),
+       $container->get('path_processor_manager'),
+-      $container->get('current_route_match')
++      $container->get('current_route_match'),
++      $container->get('plugin.manager.block')
+     );
+   }
+ 
+@@ -121,6 +122,18 @@ class FacetBlockAjaxController extends ControllerBase {
+     $base_url = strpos($path, $host) ? $host . base_path() : base_path();
+     $path = preg_replace('/^' . str_replace('/', '\/', $base_url) . '/', '/', $path);
+ 
++    // Ensure path is relative.
++    $host = $request->getSchemeAndHttpHost();
++    if (str_starts_with($path, $host)) {
++      $path = substr($path, strlen($host));
++    }
++
++    // Remove base_path in case the site is installed in a subdirectory.
++    $base_path = base_path();
++    if ($base_path !== '/' && str_starts_with($path, $base_path)) {
++      $path = substr($path, strlen($base_path));
++    }
++
+     if (empty($path) || empty($facets_blocks)) {
+       throw new NotFoundHttpException('No facet link or facet blocks found.');
+     }
+@@ -131,6 +144,12 @@ class FacetBlockAjaxController extends ControllerBase {
+     $new_request = Request::create($path);
+     $request_stack = new RequestStack();
+ 
++    // Add session to the response if set.
++    if ($request->hasSession()) {
++      $request->getSession()->save();
++      $new_request->setSession($request->getSession());
++    }
++
+     $processed = $this->pathProcessor->processInbound($path, $new_request);
+     $processed_request = Request::create($processed);
+ 
+@@ -141,40 +160,56 @@ class FacetBlockAjaxController extends ControllerBase {
+ 
+     $container = \Drupal::getContainer();
+     $container->set('request_stack', $request_stack);
+-    $active_facet = $request->request->get('active_facet');
+-
+-    // Build the facets blocks found for the current request and update.
+-    foreach ($facets_blocks as $block_id => $block_selector) {
+-      $block_entity = $this->storage->load($block_id);
+-
+-      if ($block_entity) {
+-        // Render a block, then add it to the response as a replace command.
+-        $block_view = $this->entityTypeManager
+-          ->getViewBuilder('block')
+-          ->view($block_entity);
+-
+-        $block_view = (string) $this->renderer->renderPlain($block_view);
+-        $response->addCommand(new ReplaceCommand($block_selector, $block_view));
++    foreach ($facets_blocks as $block_selector => $block_id) {
++      // Facet block render array.
++      $block_view = NULL;
++      // Re prepare from css standarts.
++      $block_id = str_replace(['--', '-'], [':', '_'], $block_id);
++
++      // @todo We should not create an instance if we have already created one.
++      $block_instance = $this->blockManager->createInstance($block_id);
++      if ($block_instance) {
++        $block_view = $block_instance->build();
++        if ($block_view) {
++          // Replace content current ID selector.
++          $response->addCommand(new ReplaceCommand('#' . $block_selector, $block_view));
++          // Hide or show block.
++          $facet_id = explode(':', $block_id)[1];
++          $hide_show_selector = '[data-drupal-block-facet-id = "' . $facet_id . '"]';
++          if (!empty($block_view['facet_block']['#attributes']['class']) && in_array('hidden', $block_view['facet_block']['#attributes']['class'])) {
++            $response->addCommand(new InvokeCommand($hide_show_selector, 'addClass', ['hidden']));
++          }
++          else {
++            $response->addCommand(new InvokeCommand($hide_show_selector, 'removeClass', ['hidden']));
++          }
++        }
+       }
+     }
+ 
+-    $response->addCommand(new InvokeCommand('[data-block-plugin-id="' . $active_facet . '"]', 'addClass', ['facet-active']));
+-
+     // Update filter summary block.
+     $update_summary_block = $request->request->get('update_summary_block');
+     if ($update_summary_block) {
+-      $facet_summary_block_id = $request->request->get('facet_summary_block_id');
+-      $facet_summary_wrapper_id = $request->request->get('facet_summary_wrapper_id');
+-      $facet_summary_block_id = str_replace('-', '_', $facet_summary_block_id);
+-
+-      if ($facet_summary_block_id) {
+-        $block_entity = $this->storage->load($facet_summary_block_id);
+-        $block_view = $this->entityTypeManager
+-          ->getViewBuilder('block')
+-          ->view($block_entity);
+-        $block_view = (string) $this->renderer->renderPlain($block_view);
+-
+-        $response->addCommand(new ReplaceCommand('[data-drupal-facets-summary-id=' . $facet_summary_wrapper_id . ']', $block_view));
++      $facet_summary_plugin_ids = $request->request->all()['facet_summary_plugin_ids'] ?? [];
++      foreach ($facet_summary_plugin_ids as $block_selector => $summary_plugin_id) {
++        // Facet summary block render array.
++        $block_view = NULL;
++        // @todo We should not create an instance if we have already created one.
++        $block_instance = $this->blockManager->createInstance($summary_plugin_id);
++        if ($block_instance) {
++          $block_view = $block_instance->build();
++          if ($block_view) {
++            // Replace content facets summary plugin ID selector.
++            $response->addCommand(new ReplaceCommand('[data-drupal-facets-summary-plugin-id = "' . $summary_plugin_id . '"]', $block_view));
++            // Hide or show block.
++            $hide_show_selector = '[data-drupal-block-facet-summary-id = "' . $summary_plugin_id . '"]';
++            if (!empty($block_view['facets_summary']['#attributes']['class']) && in_array('hidden', $block_view['facets_summary']['#attributes']['class'])) {
++              $response->addCommand(new InvokeCommand($hide_show_selector, 'addClass', ['hidden']));
++            }
++            else {
++              $response->addCommand(new InvokeCommand($hide_show_selector, 'removeClass', ['hidden']));
++            }
++          }
++        }
+       }
+     }
+ 
+diff --git a/src/Plugin/Block/FacetBlock.php b/src/Plugin/Block/FacetBlock.php
+index 00c68f1..304e598 100644
+--- a/src/Plugin/Block/FacetBlock.php
++++ b/src/Plugin/Block/FacetBlock.php
+@@ -2,13 +2,14 @@
+ 
+ namespace Drupal\facets\Plugin\Block;
+ 
++use Drupal\Component\Utility\Html;
+ use Drupal\Core\Access\AccessResult;
+ use Drupal\Core\Block\BlockBase;
+ use Drupal\Core\Cache\Cache;
+ use Drupal\Core\Cache\CacheableMetadata;
+ use Drupal\Core\Entity\EntityStorageInterface;
+-use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+ use Drupal\Core\Form\FormStateInterface;
++use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
+ use Drupal\Core\Session\AccountInterface;
+ use Drupal\facets\FacetInterface;
+ use Drupal\facets\FacetManager\DefaultFacetManager;
+@@ -39,6 +40,8 @@ class FacetBlock extends BlockBase implements ContainerFactoryPluginInterface {
+   protected $facetStorage;
+ 
+   /**
++   * The facet entity.
++   *
+    * @var \Drupal\facets\FacetInterface
+    */
+   protected $facet;
+@@ -87,43 +90,63 @@ class FacetBlock extends BlockBase implements ContainerFactoryPluginInterface {
+ 
+     $facet = $this->getFacet();
+ 
++    $build = [];
++
+     // Let the facet_manager build the facets.
+-    $build = $this->facetManager->build($facet);
++    $facet_build = $this->facetManager->build($facet);
+ 
+-    if (!empty($build)) {
++    if ($facet_build) {
+       CacheableMetadata::createFromObject($this)->applyTo($build);
+ 
+       // Add extra elements from facet source, for example, ajax scripts.
+       // @see Drupal\facets\Plugin\facets\facet_source\SearchApiDisplay
+       /** @var \Drupal\facets\FacetSource\FacetSourcePluginInterface $facet_source */
+       $facet_source = $facet->getFacetSource();
+-      $build += $facet_source->buildFacet();
+-
+-      // Add contextual links only when we have results.
+-      $build['#contextual_links']['facets_facet'] = [
+-        'route_parameters' => ['facets_facet' => $facet->id()],
++      $facet_build += $facet_source->buildFacet();
++
++      $build = [
++        '#type' => 'container',
++        '#contextual_links' => [
++          'facets_facet' => [
++            'route_parameters' => ['facets_facet' => $facet->id()],
++          ],
++        ],
++        '#attributes' => [
++          'class' => ['block-facet__wrapper'],
++        ],
++        0 => $facet_build,
+       ];
+ 
+-      if (!empty($build[0]['#attributes']['class']) && in_array('facet-active', $build[0]['#attributes']['class'], TRUE)) {
+-        $build['#attributes']['class'][] = 'facet-active';
+-      }
+-      else {
+-        $build['#attributes']['class'][] = 'facet-inactive';
++      // Add css classes.
++      if (!empty($facet_build[0]['#attributes']['class'])) {
++        $css_classes = $facet_build[0]['#attributes']['class'];
++        // Active/inactive css classes.
++        if (in_array('facet-active', $css_classes)) {
++          $build['#attributes']['class'][] = 'facet-active';
++        }
++        else {
++          $build['#attributes']['class'][] = 'facet-inactive';
++        }
++        // Whether it is necessary to add hide css class.
++        if (in_array('facet-hidden', $css_classes)) {
++          $build['#attributes']['class'][] = 'hidden';
++        }
+       }
+ 
+       // Add classes needed for ajax.
+-      if (!empty($build['#use_ajax'])) {
++      if (!empty($facet_build['#use_ajax'])) {
+         $build['#attributes']['class'][] = 'block-facets-ajax';
+-        // The configuration block id isn't always set in the configuration.
+-        if (isset($this->configuration['block_id'])) {
+-          $build['#attributes']['class'][] = 'js-facet-block-id-' . $this->configuration['block_id'];
+-        }
+-        else {
+-          $build['#attributes']['class'][] = 'js-facet-block-id-' . $this->pluginId;
+-        }
++        $block_id = str_replace(':', '--', $this->pluginId);
++        $block_id = Html::cleanCssIdentifier($block_id);
++        $build['#attributes']['class'][] = 'js-facet-block-id-' . $block_id;
++        $build['#attributes']['id'] = Html::getUniqueId($block_id);
+       }
+-    }
+ 
++      // To render correctly in different situations.
++      $build = [
++        'facet_block' => $build,
++      ];
++    }
+     return $build;
+   }
+ 
+diff --git a/tests/src/FunctionalJavascript/AjaxBehaviorTest.php b/tests/src/FunctionalJavascript/AjaxBehaviorTest.php
+index 551cb9f..6ce3ef3 100644
+--- a/tests/src/FunctionalJavascript/AjaxBehaviorTest.php
++++ b/tests/src/FunctionalJavascript/AjaxBehaviorTest.php
+@@ -101,11 +101,11 @@ class AjaxBehaviorTest extends JsBase {
+     $assert_session->pageTextContains('Displaying 5 search results');
+ 
+     // Check that the article_category option disappears when filtering on item.
+-    $dropdown_entry = $this->xpath('//*[@id="block-duck-block"]/div/select/option[normalize-space(text())=:label]', [':label' => 'article_category']);
++    $dropdown_entry = $this->xpath('//*[@id="block-duck-block"]/div/div/select/option[normalize-space(text())=:label]', [':label' => 'article_category']);
+     $this->assertNotEmpty($dropdown_entry);
+     $block_owl->clickLink('item');
+     $assert_session->assertWaitOnAjaxRequest();
+-    $dropdown_entry = $this->xpath('//*[@id="block-duck-block"]/div/select/option[normalize-space(text())=:label]', [':label' => 'article_category']);
++    $dropdown_entry = $this->xpath('//*[@id="block-duck-block"]/div/div/select/option[normalize-space(text())=:label]', [':label' => 'article_category']);
+     $this->assertEmpty($dropdown_entry);
+ 
+     // Click the item facet again.
+@@ -113,7 +113,7 @@ class AjaxBehaviorTest extends JsBase {
+     $assert_session->assertWaitOnAjaxRequest();
+ 
+     // Select the article_category in the dropdown.
+-    $dropdown = $this->xpath('//*[@id="block-duck-block"]/div/select');
++    $dropdown = $this->xpath('//*[@id="block-duck-block"]/div/div/select');
+     $dropdown[0]->selectOption('article_category');
+     $assert_session->assertWaitOnAjaxRequest();
+ 
+-- 
+2.30.2
+

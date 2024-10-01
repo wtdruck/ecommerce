@@ -1,0 +1,15 @@
+_core:
+  default_config_hash: HlN7eAN2N4JIHsYv56V4E7sqC9bS609KwvGFjyD_mgk
+langcode: en
+uuid: 4dd1a38e-5cec-450d-a486-1f9db684f464
+name: 'W. T. Druck E-Commerce'
+mail: admin@wtdruck-ecommerce.ddev.site
+slogan: ''
+page:
+  403: ''
+  404: ''
+  front: /node
+admin_compact_mode: false
+weight_select_max: 100
+default_langcode: en
+mail_notification: null

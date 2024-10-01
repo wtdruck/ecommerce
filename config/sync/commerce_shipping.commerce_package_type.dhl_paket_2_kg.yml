@@ -1,0 +1,14 @@
+uuid: 41b12596-41be-42ea-bc39-c5c463e9d2fc
+langcode: en
+status: true
+dependencies: {  }
+id: dhl_paket_2_kg
+label: 'DHL Paket 2 kg'
+dimensions:
+  length: '60'
+  width: '30'
+  height: '15'
+  unit: cm
+weight:
+  number: '2'
+  unit: kg

@@ -1,0 +1,17 @@
+uuid: 296b9483-cc50-480b-a2c5-4f2b4982c33c
+langcode: en
+status: true
+dependencies: {  }
+_core:
+  default_config_hash: ccmJnYDefjjUJ1_S8QUpDMgN41yZcLULtiTOdR1sJmo
+label: Invoice
+id: default
+numberPattern: invoice_default
+logo: null
+dueDays: null
+paymentTerms: ''
+footerText: ''
+traits: {  }
+workflow: invoice_default
+sendConfirmation: false
+confirmationBcc: ''

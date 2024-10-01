@@ -1,0 +1,14 @@
+uuid: 7ada1c05-b03e-4058-95c2-baae4c8ebbf0
+langcode: en
+status: true
+dependencies: {  }
+id: dhl_paket_5_kg
+label: 'DHL Paket 5 kg'
+dimensions:
+  length: '120'
+  width: '60'
+  height: '60'
+  unit: cm
+weight:
+  number: '5'
+  unit: kg

@@ -1,0 +1,14 @@
+uuid: 8fc9363c-a975-48d2-806c-fb131737dee9
+langcode: en
+status: true
+dependencies: {  }
+id: dhl_paket_20_kg
+label: 'DHL Paket 20 kg'
+dimensions:
+  length: '120'
+  width: '60'
+  height: '60'
+  unit: cm
+weight:
+  number: '20'
+  unit: kg

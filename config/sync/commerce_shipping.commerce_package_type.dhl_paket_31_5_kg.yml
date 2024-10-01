@@ -1,0 +1,14 @@
+uuid: 1b2132b6-6a09-4148-ae47-d5a042115a9a
+langcode: en
+status: true
+dependencies: {  }
+id: dhl_paket_31_5_kg
+label: 'DHL Paket 31,5 kg'
+dimensions:
+  length: '120'
+  width: '60'
+  height: '60'
+  unit: cm
+weight:
+  number: '31.5'
+  unit: kg

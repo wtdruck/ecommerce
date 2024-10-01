@@ -1,0 +1,14 @@
+uuid: 61a3aefb-00c1-49b3-8070-9ba9942c295d
+langcode: en
+status: true
+dependencies: {  }
+id: dhl_paket_10_kg
+label: 'DHL Paket 10 kg'
+dimensions:
+  length: '120'
+  width: '60'
+  height: '60'
+  unit: cm
+weight:
+  number: '10'
+  unit: kg

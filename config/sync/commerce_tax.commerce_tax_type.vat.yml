@@ -1,0 +1,16 @@
+uuid: 89720c9c-7b77-4f29-8178-afb809c78fbc
+langcode: en
+status: true
+dependencies: {  }
+id: vat
+label: VAT
+plugin: european_union_vat
+configuration:
+  display_inclusive: true
+conditions:
+  -
+    plugin: order_currency
+    configuration:
+      currencies:
+        - EUR
+conditionOperator: AND

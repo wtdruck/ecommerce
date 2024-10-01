@@ -1,0 +1,43 @@
+uuid: 8594b3a4-3e59-40d8-8c8e-13264014535e
+langcode: en
+status: true
+dependencies:
+  module:
+    - commerce_stripe
+id: stripe_payment_element
+label: 'Stripe Payment Element'
+weight: null
+plugin: stripe_payment_element
+configuration:
+  display_label: 'Stripe Payment Element'
+  mode: test
+  payment_method_types:
+    - credit_card
+  collect_billing_information: true
+  publishable_key: ''
+  secret_key: ''
+  payment_method_usage: on_session
+  style:
+    theme: stripe
+    layout: tabs
+  checkout_form_display_label:
+    custom_label: ''
+    show_payment_method_logos: 'no'
+    include_logos:
+      visa: visa
+      mastercard: mastercard
+      amex: amex
+      discover: discover
+      maestro: '0'
+      dinersclub: '0'
+      jcb: '0'
+      unionpay: '0'
+      applepay: '0'
+      googlepay: '0'
+conditions:
+  -
+    plugin: order_currency
+    configuration:
+      currencies:
+        - EUR
+conditionOperator: AND
